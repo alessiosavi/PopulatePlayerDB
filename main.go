@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -42,6 +44,17 @@ func main() {
 	// Initialize a new connection to DynamoDB
 	svc := initDynamoDBConnection()
 
+	_, _ = insertDataIntoDynamo(playerData, tableName, svc)
+
+	_, _ = retrieveDataFromDynamo(playerData, tableName, svc)
+
+}
+
+func insertDataIntoDynamo(playerData []players.PlayerData, tableName string, svc *dynamodb.DynamoDB) (map[string][]*dynamodb.WriteRequest, error) {
+
+	var err error
+	var result *dynamodb.BatchWriteItemOutput
+	var unprocessed map[string][]*dynamodb.WriteRequest = make(map[string][]*dynamodb.WriteRequest)
 	// Converting the array player into dynamo put request
 	var requests []map[string]*dynamodb.AttributeValue = make([]map[string]*dynamodb.AttributeValue, len(playerData))
 	for i, pData := range playerData {
@@ -56,40 +69,53 @@ func main() {
 		var dynamoRequest []*dynamodb.WriteRequest
 		// Loading the 25 request
 		for j := i; j < i+batchWriteItemSize; j++ {
-			log.Println("Managing ", j)
+			//log.Println("Managing ", j)
 			var r dynamodb.WriteRequest
 			r.PutRequest = &dynamodb.PutRequest{Item: requests[j]}
 			dynamoRequest = append(dynamoRequest, &r)
 		}
 		itemInput.RequestItems[tableName] = dynamoRequest
-		result, err := svc.BatchWriteItem(&itemInput)
-		if err != nil {
-			log.Printf("Err: %+v\n", err)
-		} else {
-			log.Printf("Result: %+v\n", result)
+		if result, err = svc.BatchWriteItem(&itemInput); err != nil || len(result.UnprocessedItems[tableName]) > 0 {
+			if result != nil {
+				unprocessed[tableName] = append(unprocessed[tableName], result.UnprocessedItems[tableName]...)
+			}
+			log.Printf("Error during insert %s\n", err.Error())
 		}
+		//log.Printf("Result: %+v\n", result)
 	}
 	// Managing the other put request, less than 25
 	{
 		itemInput := dynamodb.BatchWriteItemInput{RequestItems: map[string][]*dynamodb.WriteRequest{tableName: {}}}
 		var dynamoRequest []*dynamodb.WriteRequest
 		for ; i < len(requests); i++ {
-			log.Println("Managing ", i)
+			//log.Println("Managing ", i)
 			var r dynamodb.WriteRequest
 			r.PutRequest = &dynamodb.PutRequest{Item: requests[i]}
 			dynamoRequest = append(dynamoRequest, &r)
 		}
 		itemInput.RequestItems[tableName] = dynamoRequest
-		result, err := svc.BatchWriteItem(&itemInput)
-		if err != nil {
-			log.Printf("Err: %+v\n", err)
-		} else {
-			log.Printf("Result: %+v\n", result)
+		if result, err = svc.BatchWriteItem(&itemInput); err != nil || len(result.UnprocessedItems[tableName]) > 0 {
+			if result != nil {
+				unprocessed[tableName] = append(unprocessed[tableName], result.UnprocessedItems[tableName]...)
+			}
+			log.Printf("Error during insert %s\n", err.Error())
 		}
+		//log.Printf("Result: %+v\n", result)
 	}
+	if len(unprocessed) > 0 {
+		err = errors.New(fmt.Sprintf("Unable to insert %d put request", len(unprocessed)))
+	} else {
+		err = nil
+	}
+	return unprocessed, err
+}
 
+func retrieveDataFromDynamo(playerData []players.PlayerData, tableName string, svc *dynamodb.DynamoDB) ([]players.PlayerData, error) {
 	// Retrieve the Item from dynamo
-	i = 0
+	var i = 0
+	var data []players.PlayerData
+	var result *dynamodb.BatchGetItemOutput
+	var err error
 	for ; i < len(playerData)-batchGetItemSize; i += batchGetItemSize {
 		getInput := dynamodb.BatchGetItemInput{RequestItems: map[string]*dynamodb.KeysAndAttributes{tableName: {}}}
 		for j := i; j < i+batchGetItemSize; j++ {
@@ -98,37 +124,33 @@ func main() {
 				"Username": &dynamodb.AttributeValue{S: aws.String(playerData[j].Username)}}
 			getInput.RequestItems[tableName].Keys = append(getInput.RequestItems[tableName].Keys, key)
 		}
-		result, err := svc.BatchGetItem(&getInput)
-		if err != nil {
-			panic(err)
+		if result, err = svc.BatchGetItem(&getInput); err != nil {
+			return nil, err
 		}
-		var data []players.PlayerData
-		if err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &data); err != nil {
-			panic(err)
+		var tmp []players.PlayerData
+		if err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &tmp); err != nil {
+			return nil, err
 		}
-		log.Printf("Data from dynamo\n%+v\n", data)
-		log.Println("len data: ", len(data))
+		data = append(data, tmp...)
 	}
 	{
 		getInput := dynamodb.BatchGetItemInput{RequestItems: map[string]*dynamodb.KeysAndAttributes{tableName: {}}}
-		for ; i < len(requests); i++ {
+		for ; i < len(playerData); i++ {
 			key := map[string]*dynamodb.AttributeValue{
 				"ID":       &dynamodb.AttributeValue{S: aws.String(playerData[i].ID)},
 				"Username": &dynamodb.AttributeValue{S: aws.String(playerData[i].Username)}}
 			getInput.RequestItems[tableName].Keys = append(getInput.RequestItems[tableName].Keys, key)
 		}
-		result, err := svc.BatchGetItem(&getInput)
-		if err != nil {
-			panic(err)
+		if result, err = svc.BatchGetItem(&getInput); err != nil {
+			return nil, err
 		}
-		var data []players.PlayerData
-		if err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &data); err != nil {
-			panic(err)
+		var tmp []players.PlayerData
+		if err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &tmp); err != nil {
+			return nil, err
 		}
-		log.Printf("Data from dynamo\n%+v\n", data)
-		log.Println("len data: ", len(data))
+		data = append(data, tmp...)
 	}
-
+	return playerData, nil
 }
 
 func initDynamoDBConnection() *dynamodb.DynamoDB {
