@@ -22,6 +22,22 @@ type InputRequest struct {
 	Uni string `json:"uni"`
 }
 
+// Convert the list of the players present in the universe in a map
+func convertListPlayerToMap(p []players.Player) map[string]players.Player {
+	var pMap map[string]players.Player = make(map[string]players.Player, len(p))
+	for i := range p {
+		pMap[p[i].ID] = p[i]
+	}
+	return pMap
+}
+
+func convertListPlayerDataToMap(p []players.PlayerData) *sync.Map {
+	var pMap sync.Map
+	for i := range p {
+		pMap.Store(p[i].ID, p[i])
+	}
+	return &pMap
+}
 func check(err error) {
 	if err != nil {
 		panic(err)
@@ -29,29 +45,76 @@ func check(err error) {
 }
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-	// Loading all players from http api
-	p, err := players.LoadPlayers(166)
-	check(err)
 
+	// Try to search the table_name from the lambda environment, or use fallback name "PlayerData"
 	tableName := os.Getenv("table_name")
 	if tableName == "" {
+		log.Printf("WARNING! `table_name` not found in env!")
 		tableName = "PlayerData"
 	}
 
-	// Download the player data from API
-	playerData := downloadPlayerData(166, p)
+	var uni int = 166
+	log.Printf("Loading players from uni %d\n", uni)
+	// Retrieving all players from the http api
+	p, err := players.LoadPlayers(uni)
+	check(err)
+	log.Printf("Loaded %d players from uni %d\n", len(p.Players), uni)
 
+	log.Println("Converting list to map ...")
+	// Convert them into a map for faster search
+	pMap := convertListPlayerToMap(p.Players)
+	log.Println("List converted into Map!")
+
+	log.Println("Initializing a new connection to DynamoDB ...")
 	// Initialize a new connection to DynamoDB
 	svc := initDynamoDBConnection()
+	log.Println("Connection to DynamoDB initialized!")
+
+	log.Println("Retrieving players from dynamo ...")
+	// Retrieve the users that are already present into DynamoDB, these ones have to be updated
+	playersAlreadyPresentInDynamo, _ := retrieveDataFromDynamo(p.Players, tableName, svc)
+	log.Printf("Retrieved %d players from dynamo!", len(playersAlreadyPresentInDynamo))
+
+	// And convert them into a map for faster search
+	log.Println("Converting list to map ...")
+	pDataAlreadyPresent := convertListPlayerDataToMap(playersAlreadyPresentInDynamo)
+	log.Println("List converted to map ...")
+	playersAlreadyPresentInDynamo = nil
+
+	// These users are the one that are not present into DynamoDB, so they have to be inserted
+	var pDataToInsert sync.Map
+
+	log.Println("Filtering user that have to be updated ...")
+	// Iterating the map related to all the users
+	for keyP := range pMap {
+		// Check if the player related to the keyP is already present in DynamoDB
+		if _, ok := pDataAlreadyPresent.Load(keyP); !ok {
+			// If not present, than it have to be inserted into dynamo
+			pDataToInsert.Store(pMap[keyP].ID, pMap[keyP])
+		}
+	}
+	log.Printf("Need to update %d users and insert %d users\n", countMapEntries(pDataAlreadyPresent), countMapEntries(&pDataToInsert))
+	// Now we have two sync.Map, thread safe, that contains:
+	// pDataAlreadyPresent -> contains the user that have to be updated
+	// pDataToInsert -> contains the user that have to be inserted
+
+	// Download ALL the player data from the API
+	playerData := downloadPlayerData(166, p)
 
 	_, _ = insertDataIntoDynamo(playerData, tableName, svc)
 
-	_, _ = retrieveDataFromDynamo(playerData, tableName, svc)
+}
 
+func countMapEntries(pDataAlreadyPresent *sync.Map) int {
+	var a int
+	pDataAlreadyPresent.Range(func(_, _ interface{}) bool {
+		a++
+		return true
+	})
+	return a
 }
 
 func insertDataIntoDynamo(playerData []players.PlayerData, tableName string, svc *dynamodb.DynamoDB) (map[string][]*dynamodb.WriteRequest, error) {
-
 	var err error
 	var result *dynamodb.BatchWriteItemOutput
 	var unprocessed map[string][]*dynamodb.WriteRequest = make(map[string][]*dynamodb.WriteRequest)
@@ -79,7 +142,9 @@ func insertDataIntoDynamo(playerData []players.PlayerData, tableName string, svc
 			if result != nil {
 				unprocessed[tableName] = append(unprocessed[tableName], result.UnprocessedItems[tableName]...)
 			}
-			log.Printf("Error during insert %s\n", err.Error())
+			if err != nil {
+				log.Printf("Error during insert %s\n", err.Error())
+			}
 		}
 		//log.Printf("Result: %+v\n", result)
 	}
@@ -98,7 +163,9 @@ func insertDataIntoDynamo(playerData []players.PlayerData, tableName string, svc
 			if result != nil {
 				unprocessed[tableName] = append(unprocessed[tableName], result.UnprocessedItems[tableName]...)
 			}
-			log.Printf("Error during insert %s\n", err.Error())
+			if err != nil {
+				log.Printf("Error during insert %s\n", err.Error())
+			}
 		}
 		//log.Printf("Result: %+v\n", result)
 	}
@@ -110,18 +177,18 @@ func insertDataIntoDynamo(playerData []players.PlayerData, tableName string, svc
 	return unprocessed, err
 }
 
-func retrieveDataFromDynamo(playerData []players.PlayerData, tableName string, svc *dynamodb.DynamoDB) ([]players.PlayerData, error) {
+func retrieveDataFromDynamo(p []players.Player, tableName string, svc *dynamodb.DynamoDB) ([]players.PlayerData, error) {
 	// Retrieve the Item from dynamo
 	var i = 0
 	var data []players.PlayerData
 	var result *dynamodb.BatchGetItemOutput
 	var err error
-	for ; i < len(playerData)-batchGetItemSize; i += batchGetItemSize {
+	for ; i < len(p)-batchGetItemSize; i += batchGetItemSize {
 		getInput := dynamodb.BatchGetItemInput{RequestItems: map[string]*dynamodb.KeysAndAttributes{tableName: {}}}
 		for j := i; j < i+batchGetItemSize; j++ {
 			key := map[string]*dynamodb.AttributeValue{
-				"ID":       &dynamodb.AttributeValue{S: aws.String(playerData[j].ID)},
-				"Username": &dynamodb.AttributeValue{S: aws.String(playerData[j].Username)}}
+				"ID":       &dynamodb.AttributeValue{S: aws.String(p[j].ID)},
+				"Username": &dynamodb.AttributeValue{S: aws.String(p[j].Name)}}
 			getInput.RequestItems[tableName].Keys = append(getInput.RequestItems[tableName].Keys, key)
 		}
 		if result, err = svc.BatchGetItem(&getInput); err != nil {
@@ -135,10 +202,10 @@ func retrieveDataFromDynamo(playerData []players.PlayerData, tableName string, s
 	}
 	{
 		getInput := dynamodb.BatchGetItemInput{RequestItems: map[string]*dynamodb.KeysAndAttributes{tableName: {}}}
-		for ; i < len(playerData); i++ {
+		for ; i < len(p); i++ {
 			key := map[string]*dynamodb.AttributeValue{
-				"ID":       &dynamodb.AttributeValue{S: aws.String(playerData[i].ID)},
-				"Username": &dynamodb.AttributeValue{S: aws.String(playerData[i].Username)}}
+				"ID":       &dynamodb.AttributeValue{S: aws.String(p[i].ID)},
+				"Username": &dynamodb.AttributeValue{S: aws.String(p[i].Name)}}
 			getInput.RequestItems[tableName].Keys = append(getInput.RequestItems[tableName].Keys, key)
 		}
 		if result, err = svc.BatchGetItem(&getInput); err != nil {
@@ -150,7 +217,7 @@ func retrieveDataFromDynamo(playerData []players.PlayerData, tableName string, s
 		}
 		data = append(data, tmp...)
 	}
-	return playerData, nil
+	return data, nil
 }
 
 func initDynamoDBConnection() *dynamodb.DynamoDB {
