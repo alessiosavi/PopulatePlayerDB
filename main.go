@@ -1,15 +1,20 @@
 package main
 
 import (
+	"log"
+	"os"
+	"sync"
+
 	"github.com/alessiosavi/GoStatOgame/datastructure/players"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
-	"log"
-	"os"
-	"sync"
 )
+
+// AWS limit for put/get batch operation
+const batchWriteItemSize = 25
+const batchGetItemSize = 100
 
 type InputRequest struct {
 	Uni string `json:"uni"`
@@ -31,7 +36,7 @@ func main() {
 		tableName = "PlayerData"
 	}
 
-	// Retrieve the player from API
+	// Download the player data from API
 	playerData := downloadPlayerData(166, p)
 
 	// Initialize a new connection to DynamoDB
@@ -46,20 +51,17 @@ func main() {
 	}
 	var i int = 0
 	// Executing 25 request in batch
-	for ; i < len(requests)-25; i += 25 {
-		itemInput := dynamodb.BatchWriteItemInput{RequestItems:
-		map[string][]*dynamodb.WriteRequest{tableName: {}}}
+	for ; i < len(requests)-batchWriteItemSize; i += batchWriteItemSize {
+		itemInput := dynamodb.BatchWriteItemInput{RequestItems: map[string][]*dynamodb.WriteRequest{tableName: {}}}
 		var dynamoRequest []*dynamodb.WriteRequest
 		// Loading the 25 request
-		for j := i; j < i+25; j++ {
+		for j := i; j < i+batchWriteItemSize; j++ {
 			log.Println("Managing ", j)
 			var r dynamodb.WriteRequest
-			r.PutRequest = &dynamodb.PutRequest{
-				Item: requests[j],
-			}
+			r.PutRequest = &dynamodb.PutRequest{Item: requests[j]}
 			dynamoRequest = append(dynamoRequest, &r)
 		}
-		itemInput.RequestItems[tableName] = append(itemInput.RequestItems[tableName], dynamoRequest...)
+		itemInput.RequestItems[tableName] = dynamoRequest
 		result, err := svc.BatchWriteItem(&itemInput)
 		if err != nil {
 			log.Printf("Err: %+v\n", err)
@@ -67,20 +69,17 @@ func main() {
 			log.Printf("Result: %+v\n", result)
 		}
 	}
-	// Managing the other put request less than 25
+	// Managing the other put request, less than 25
 	{
-		itemInput := dynamodb.BatchWriteItemInput{RequestItems:
-		map[string][]*dynamodb.WriteRequest{tableName: {}}}
+		itemInput := dynamodb.BatchWriteItemInput{RequestItems: map[string][]*dynamodb.WriteRequest{tableName: {}}}
 		var dynamoRequest []*dynamodb.WriteRequest
 		for ; i < len(requests); i++ {
 			log.Println("Managing ", i)
 			var r dynamodb.WriteRequest
-			r.PutRequest = &dynamodb.PutRequest{
-				Item: requests[i],
-			}
+			r.PutRequest = &dynamodb.PutRequest{Item: requests[i]}
 			dynamoRequest = append(dynamoRequest, &r)
-			itemInput.RequestItems[tableName] = append(itemInput.RequestItems[tableName], dynamoRequest...)
 		}
+		itemInput.RequestItems[tableName] = dynamoRequest
 		result, err := svc.BatchWriteItem(&itemInput)
 		if err != nil {
 			log.Printf("Err: %+v\n", err)
@@ -89,11 +88,11 @@ func main() {
 		}
 	}
 
-	for i = 0; i < len(playerData)-100; i += 100 {
-		getInput := dynamodb.BatchGetItemInput{
-			RequestItems: map[string]*dynamodb.KeysAndAttributes{
-				tableName: {}}}
-		for j := i; j < i+100; j++ {
+	// Retrieve the Item from dynamo
+	i = 0
+	for ; i < len(playerData)-batchGetItemSize; i += batchGetItemSize {
+		getInput := dynamodb.BatchGetItemInput{RequestItems: map[string]*dynamodb.KeysAndAttributes{tableName: {}}}
+		for j := i; j < i+batchGetItemSize; j++ {
 			key := map[string]*dynamodb.AttributeValue{
 				"ID":       &dynamodb.AttributeValue{S: aws.String(playerData[j].ID)},
 				"Username": &dynamodb.AttributeValue{S: aws.String(playerData[j].Username)}}
@@ -104,19 +103,15 @@ func main() {
 			panic(err)
 		}
 		var data []players.PlayerData
-		err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &data)
+		if err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &data); err != nil {
+			panic(err)
+		}
 		log.Printf("Data from dynamo\n%+v\n", data)
 		log.Println("len data: ", len(data))
 	}
 	{
-		getInput := dynamodb.BatchGetItemInput{
-			RequestItems: map[string]*dynamodb.KeysAndAttributes{
-				tableName: {}}}
+		getInput := dynamodb.BatchGetItemInput{RequestItems: map[string]*dynamodb.KeysAndAttributes{tableName: {}}}
 		for ; i < len(requests); i++ {
-			getInput := dynamodb.BatchGetItemInput{
-				RequestItems: map[string]*dynamodb.KeysAndAttributes{
-					tableName: {}}}
-
 			key := map[string]*dynamodb.AttributeValue{
 				"ID":       &dynamodb.AttributeValue{S: aws.String(playerData[i].ID)},
 				"Username": &dynamodb.AttributeValue{S: aws.String(playerData[i].Username)}}
@@ -127,7 +122,9 @@ func main() {
 			panic(err)
 		}
 		var data []players.PlayerData
-		err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &data)
+		if err = dynamodbattribute.UnmarshalListOfMaps(result.Responses[tableName], &data); err != nil {
+			panic(err)
+		}
 		log.Printf("Data from dynamo\n%+v\n", data)
 		log.Println("len data: ", len(data))
 	}
@@ -138,21 +135,19 @@ func initDynamoDBConnection() *dynamodb.DynamoDB {
 	sess := session.Must(session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
 	}))
-
 	// Create DynamoDB client
 	svc := dynamodb.New(sess)
 	return svc
 }
 
 // Retrieve every stats for all the players that play the universe
-// TODO Add threading
 func downloadPlayerData(uni int, player players.Players) []players.PlayerData {
-	var playersData []players.PlayerData = make([]players.PlayerData, len(player.Players))
+	var playersData []players.PlayerData
 	var pData players.PlayerData
 	var err error
 	var wg sync.WaitGroup
-	// Run 5 thread concurrently
-	semaphore := make(chan struct{}, 10)
+	// Run 3 thread concurrently
+	semaphore := make(chan struct{}, 3)
 
 	for i, p := range player.Players {
 		wg.Add(1)
@@ -163,7 +158,7 @@ func downloadPlayerData(uni int, player players.Players) []players.PlayerData {
 			} else {
 				pData.ID = p.ID
 				pData.Username = p.Name
-				playersData[i] = pData
+				playersData = append(playersData, pData)
 			}
 			func() { <-semaphore }()
 			wg.Done()
